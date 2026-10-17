@@ -2262,12 +2262,86 @@ def _empty_synth_result() -> Dict[str, Any]:
     }
 
 
-def _fetch_existing_pairs(conn: sqlite3.Connection, namespace: str) -> set:
-    rows = conn.execute(
-        "SELECT source_id, target_id FROM edges WHERE namespace = ?",
-        (namespace,),
-    ).fetchall()
-    return {(r["source_id"], r["target_id"]) for r in rows}
+# Relations whose semantics are symmetric: an edge A->B implies B~A.
+# These are excluded from cycle checking (they assert relatedness, not
+# ordering, so traversing them cannot produce a contradiction) and are
+# deduplicated in both directions. Any relation not listed here (including
+# user-defined ones) is treated as directed/conservative.
+SYMMETRIC_RELATIONS = frozenset({
+    "associated",
+    "similar_to",
+    "related_to",
+    "co_occurred",
+    "affective",
+})
+
+
+class _GraphSnapshot:
+    """In-memory directed-adjacency snapshot of a namespace's edges.
+
+    Replaces per-candidate SQL cycle checks with dict lookups, and serves
+    three purposes during synthesis:
+
+    1. Exact cycle checks without per-node SQL: cycle checks traverse only
+       directed relations (symmetric relations cannot form contradictions).
+    2. Pair+relation dedupe: an edge is a duplicate only if the exact
+       (source, target, relation) triple exists, so a weak `associated`
+       edge no longer blocks a typed `is_a`/`causes` edge between the same
+       nodes — they coexist as separate, equally traversable edges.
+    3. Exact dry_run preview: synthesized edges are recorded in the
+       snapshot even when the DB is untouched, so later candidates within
+       the same dream see them and the reported skip counts are exact.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, namespace: str) -> None:
+        rows = conn.execute(
+            "SELECT source_id, target_id, relation FROM edges WHERE namespace = ?",
+            (namespace,),
+        ).fetchall()
+        self.edges: set = {
+            (r["source_id"], r["target_id"], r["relation"]) for r in rows
+        }
+        # Directed adjacency only: symmetric relations are excluded because
+        # following them cannot return to the start as a contradiction.
+        self.adj: Dict[int, set] = {}
+        for s, t, rel in self.edges:
+            if rel not in SYMMETRIC_RELATIONS:
+                self.adj.setdefault(s, set()).add(t)
+        # Edge writes are deferred until _run_synthesis finishes so every
+        # mechanism's SQL candidate query sees the same dream-start baseline
+        # in both dry_run and real mode (see _try_upsert).
+        self.pending: List[tuple] = []
+
+    def has_edge(self, source_id: int, target_id: int, relation: str) -> bool:
+        return (source_id, target_id, relation) in self.edges
+
+    def would_cycle(self, source_id: int, target_id: int, max_depth: int) -> bool:
+        """True if adding a directed edge source_id -> target_id closes a loop.
+
+        DFS from target_id over directed adjacency, bounded by max_depth —
+        same reachability semantics as the SQL-based would_create_cycle,
+        minus one query per visited node.
+        """
+        if source_id == target_id:
+            return True
+        seen: set = set()
+        stack = [(target_id, 0)]
+        while stack:
+            node, depth = stack.pop()
+            if node == source_id:
+                return True
+            if depth >= max_depth or node in seen:
+                continue
+            seen.add(node)
+            for nxt in self.adj.get(node, ()):
+                stack.append((nxt, depth + 1))
+        return False
+
+    def add(self, source_id: int, target_id: int, relation: str) -> None:
+        """Record a (to-be-)created edge so subsequent candidates see it."""
+        self.edges.add((source_id, target_id, relation))
+        if relation not in SYMMETRIC_RELATIONS:
+            self.adj.setdefault(source_id, set()).add(target_id)
 
 
 def _try_upsert(
@@ -2279,28 +2353,38 @@ def _try_upsert(
     weight: float,
     confidence: float,
     evidence: str,
-    existing_pairs: set,
+    snapshot: "_GraphSnapshot",
     dry_run: bool,
 ) -> str:
     """Return one of: created, skipped_exists, skipped_cycle, skipped_invalid.
 
-    Note: in dry_run the real graph is not mutated, so `would_create_cycle`
-    sees the *original* graph. Cycle skips for chains that would only form
-    from other synthesized edges may be under-reported.
+    Dedupe is per (source, target, relation): a weak `associated` edge
+    between two nodes does not block a typed `is_a` edge — both can exist.
+    Symmetric relations additionally treat the reversed pair as the same
+    edge. Cycle checks use the in-memory snapshot: symmetric relations are
+    excluded from the traversal (they cannot form contradictions), and the
+    snapshot is updated even in dry_run so that within one dream, later
+    candidates see earlier synthesized edges — skip counts are exact in
+    both modes.
     """
     if source_id == target_id:
         return "skipped_invalid"
-    if (source_id, target_id) in existing_pairs:
+    if snapshot.has_edge(source_id, target_id, relation):
         return "skipped_exists"
-    if would_create_cycle(conn, namespace, source_id, target_id, MAX_GRAPH_DEPTH):
+    if relation in SYMMETRIC_RELATIONS and snapshot.has_edge(target_id, source_id, relation):
+        return "skipped_exists"
+    if relation not in SYMMETRIC_RELATIONS and snapshot.would_cycle(
+        source_id, target_id, MAX_GRAPH_DEPTH
+    ):
         return "skipped_cycle"
-    existing_pairs.add((source_id, target_id))
+    snapshot.add(source_id, target_id, relation)
     if dry_run:
         return "created"
-    try:
-        upsert_edge(conn, namespace, source_id, target_id, relation, weight, confidence, evidence)
-    except Exception:
-        return "skipped_invalid"
+    # Real run: record for deferred write. Mechanisms after this one still
+    # read the dream-start DB for candidate discovery, so candidate pools
+    # are identical across dry_run/real; the edge becomes visible to SQL at
+    # flush time (end of synthesis) and cascades across future dreams.
+    snapshot.pending.append((source_id, target_id, relation, weight, confidence, evidence))
     return "created"
 
 
@@ -2319,6 +2403,7 @@ def _feature_vectors(
         JOIN nodes n ON n.id = f.node_id
         WHERE n.namespace = ? AND f.contributes = 1
           AND f.node_id IN ({placeholders})
+        ORDER BY f.node_id, f.key
         """,
         (namespace, *node_ids),
     ).fetchall()
@@ -2382,7 +2467,7 @@ def _sample_by_weight(items, weights, k, rng, temperature):
     return result
 
 
-def _synth_transitive(conn, namespace, budget, rng, temperature, existing_pairs, dry_run):
+def _synth_transitive(conn, namespace, budget, rng, temperature, snapshot, dry_run):
     result = _empty_synth_result()
     if budget <= 0:
         return result
@@ -2391,7 +2476,7 @@ def _synth_transitive(conn, namespace, budget, rng, temperature, existing_pairs,
         SELECT id, source_id, target_id, relation, weight, confidence
         FROM edges
         WHERE namespace = ? AND ABS(weight) >= 0.1
-        ORDER BY ABS(weight) DESC
+        ORDER BY ABS(weight) DESC, id
         LIMIT ?
         """,
         (namespace, MAX_SYNTHESIS_CANDIDATES),
@@ -2429,7 +2514,7 @@ def _synth_transitive(conn, namespace, budget, rng, temperature, existing_pairs,
     for c in candidates:
         status = _try_upsert(
             conn, namespace, c["source_id"], c["target_id"], c["relation"],
-            c["weight"], c["confidence"], c["evidence"], existing_pairs, dry_run,
+            c["weight"], c["confidence"], c["evidence"], snapshot, dry_run,
         )
         if status in result:
             result[status] += 1
@@ -2441,7 +2526,7 @@ def _synth_transitive(conn, namespace, budget, rng, temperature, existing_pairs,
     return result
 
 
-def _synth_feature_recombination(conn, namespace, budget, rng, temperature, existing_pairs, dry_run):
+def _synth_feature_recombination(conn, namespace, budget, rng, temperature, snapshot, dry_run):
     result = _empty_synth_result()
     if budget <= 0:
         return result
@@ -2454,7 +2539,7 @@ def _synth_feature_recombination(conn, namespace, budget, rng, temperature, exis
               SELECT 1 FROM features f
               WHERE f.node_id = n.id AND f.contributes = 1
           )
-        ORDER BY n.base_strength DESC
+        ORDER BY n.base_strength DESC, n.id
         LIMIT ?
         """,
         (namespace, MAX_SYNTHESIS_CANDIDATES),
@@ -2496,7 +2581,7 @@ def _synth_feature_recombination(conn, namespace, budget, rng, temperature, exis
     for c in candidates:
         status = _try_upsert(
             conn, namespace, c["source_id"], c["target_id"], c["relation"],
-            c["weight"], c["confidence"], c["evidence"], existing_pairs, dry_run,
+            c["weight"], c["confidence"], c["evidence"], snapshot, dry_run,
         )
         if status in result:
             result[status] += 1
@@ -2508,7 +2593,7 @@ def _synth_feature_recombination(conn, namespace, budget, rng, temperature, exis
     return result
 
 
-def _synth_analogy(conn, namespace, budget, rng, temperature, existing_pairs, dry_run):
+def _synth_analogy(conn, namespace, budget, rng, temperature, snapshot, dry_run):
     """Complete the parallelogram: A→B and C→D with similar A~C and B~D
     implies A→D and C→B."""
     result = _empty_synth_result()
@@ -2519,7 +2604,7 @@ def _synth_analogy(conn, namespace, budget, rng, temperature, existing_pairs, dr
         SELECT id, source_id, target_id, relation, weight, confidence
         FROM edges
         WHERE namespace = ? AND ABS(weight) >= 0.2
-        ORDER BY ABS(weight) DESC
+        ORDER BY ABS(weight) DESC, id
         LIMIT ?
         """,
         (namespace, MAX_SYNTHESIS_CANDIDATES),
@@ -2592,7 +2677,7 @@ def _synth_analogy(conn, namespace, budget, rng, temperature, existing_pairs, dr
     for c in candidates:
         status = _try_upsert(
             conn, namespace, c["source_id"], c["target_id"], c["relation"],
-            c["weight"], c["confidence"], c["evidence"], existing_pairs, dry_run,
+            c["weight"], c["confidence"], c["evidence"], snapshot, dry_run,
         )
         if status in result:
             result[status] += 1
@@ -2604,7 +2689,7 @@ def _synth_analogy(conn, namespace, budget, rng, temperature, existing_pairs, dr
     return result
 
 
-def _synth_schema(conn, namespace, budget, rng, temperature, existing_pairs, dry_run):
+def _synth_schema(conn, namespace, budget, rng, temperature, snapshot, dry_run):
     result = _empty_synth_result()
     result["created_nodes"] = 0
     if budget <= 0:
@@ -2616,6 +2701,7 @@ def _synth_schema(conn, namespace, budget, rng, temperature, existing_pairs, dry
         FROM features f
         JOIN nodes n ON n.id = f.node_id
         WHERE n.namespace = ? AND f.contributes = 1 AND n.suppressed = 0
+        ORDER BY f.node_id, f.key
         """,
         (namespace,),
     ).fetchall()
@@ -2668,7 +2754,7 @@ def _synth_schema(conn, namespace, budget, rng, temperature, existing_pairs, dry
             status = _try_upsert(
                 conn, namespace, nid, schema_id, "instance_of",
                 clamp(val, -1.0, 1.0), 0.7, f"schema:{key}",
-                existing_pairs, dry_run,
+                snapshot, dry_run,
             )
             if status == "created":
                 created_edges += 1
@@ -2682,7 +2768,7 @@ def _synth_schema(conn, namespace, budget, rng, temperature, existing_pairs, dry
     return result
 
 
-def _synth_journal_cooccurrence(conn, namespace, budget, rng, temperature, existing_pairs, dry_run):
+def _synth_journal_cooccurrence(conn, namespace, budget, rng, temperature, snapshot, dry_run):
     result = _empty_synth_result()
     if budget <= 0:
         return result
@@ -2695,7 +2781,7 @@ def _synth_journal_cooccurrence(conn, namespace, budget, rng, temperature, exist
         SELECT node_id, ts
         FROM journal
         WHERE namespace = ? AND node_id IS NOT NULL AND ts >= ?
-        ORDER BY ts
+        ORDER BY ts, id
         LIMIT ?
         """,
         (namespace, lookback, MAX_SYNTHESIS_CANDIDATES * 2),
@@ -2776,7 +2862,7 @@ def _synth_journal_cooccurrence(conn, namespace, budget, rng, temperature, exist
     for c in candidates:
         status = _try_upsert(
             conn, namespace, c["source_id"], c["target_id"], c["relation"],
-            c["weight"], c["confidence"], c["evidence"], existing_pairs, dry_run,
+            c["weight"], c["confidence"], c["evidence"], snapshot, dry_run,
         )
         if status in result:
             result[status] += 1
@@ -2789,7 +2875,7 @@ def _synth_journal_cooccurrence(conn, namespace, budget, rng, temperature, exist
     return result
 
 
-def _synth_emotion(conn, namespace, budget, rng, temperature, existing_pairs, dry_run):
+def _synth_emotion(conn, namespace, budget, rng, temperature, snapshot, dry_run):
     result = _empty_synth_result()
     if budget <= 0:
         return result
@@ -2798,7 +2884,7 @@ def _synth_emotion(conn, namespace, budget, rng, temperature, existing_pairs, dr
         SELECT *
         FROM nodes
         WHERE namespace = ? AND suppressed = 0
-        ORDER BY ABS(salience) DESC
+        ORDER BY ABS(salience) DESC, id
         LIMIT ?
         """,
         (namespace, MAX_SYNTHESIS_CANDIDATES),
@@ -2841,7 +2927,7 @@ def _synth_emotion(conn, namespace, budget, rng, temperature, existing_pairs, dr
     for c in candidates:
         status = _try_upsert(
             conn, namespace, c["source_id"], c["target_id"], c["relation"],
-            c["weight"], c["confidence"], c["evidence"], existing_pairs, dry_run,
+            c["weight"], c["confidence"], c["evidence"], snapshot, dry_run,
         )
         if status in result:
             result[status] += 1
@@ -2862,7 +2948,7 @@ def _run_synthesis(
     dry_run: bool,
 ) -> Dict[str, Any]:
     rng = random.Random(seed) if seed is not None else random.Random()
-    existing_pairs = _fetch_existing_pairs(conn, namespace)
+    snapshot = _GraphSnapshot(conn, namespace)
 
     # Priority order: highest-confidence signals first, exploratory ones last.
     mechanisms = [
@@ -2882,11 +2968,26 @@ def _run_synthesis(
             results[name] = {"skipped": "budget_exhausted"}
             continue
         try:
-            r = fn(conn, namespace, mech_budget, rng, temperature, existing_pairs, dry_run)
+            r = fn(conn, namespace, mech_budget, rng, temperature, snapshot, dry_run)
             results[name] = r
             total_edges += r.get("created", 0)
         except Exception as e:  # keep one broken mechanism from killing dream
             results[name] = {"error": f"{type(e).__name__}: {e}"[:200]}
+
+    # Deferred writes: flush accepted candidates to the DB in real mode.
+    # Doing this only after all mechanisms finished keeps candidate pools
+    # identical between dry_run and real (mechanisms never see each other's
+    # new edges mid-dream), while cascading inference still accumulates
+    # across successive dreams.
+    flush_errors = 0
+    if not dry_run:
+        for source_id, target_id, relation, weight, confidence, evidence in snapshot.pending:
+            try:
+                upsert_edge(conn, namespace, source_id, target_id, relation, weight, confidence, evidence)
+            except Exception:
+                flush_errors += 1
+    if flush_errors:
+        results["_flush"] = {"skipped_invalid": flush_errors}
 
     return {
         "mechanisms": results,
