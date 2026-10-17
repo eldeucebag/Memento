@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Databases created by the server / tests
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
